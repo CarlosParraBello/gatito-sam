@@ -1,0 +1,15 @@
+# Arduino / PlatformIO
+build/
+.pio/
+*.bin
+*.elf
+*.map
+
+# Editores
+.vscode/
+.idea/
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini
