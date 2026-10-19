@@ -11,12 +11,21 @@
  *  - Estrellas titilando de fondo
  *  - "Sam" rebotando con color arcoíris
  *  - Toque en pantalla: el gatito sonríe (^ ^) y suelta corazones
+ *  - Dedo sostenido: ronronea (audio + LED respirando)
+ *  - Sin toques por 30 s: se duerme (ojos cerrados, "zzz", pantalla tenue)
+ *  - Reloj sincronizado por Wi-Fi (NTP) debajo del nombre
+ *
+ * Credenciales Wi-Fi: copia secrets.example.h como secrets.h y edítalo.
  *
  * Se dibuja todo en un sprite (framebuffer) y se envía de golpe -> sin parpadeo.
  */
 
 #include <LovyanGFX.hpp>
 #include <ESP_I2S.h>   // incluido en el core ESP32 3.x
+#include <WiFi.h>
+#include "secrets.h"   // WIFI_SSID y WIFI_PASS 
+
+#define TZ_INFO "CST6"   // Ciudad de México: UTC-6, sin horario de verano
 
 // ======================= PINOUT (verificar con tu placa) =======================
 #define PIN_LCD_SCLK  12
@@ -74,7 +83,7 @@ public:
       cfg.panel_height  = 320;
       cfg.offset_rotation = 0;
       cfg.readable      = true;
-      cfg.invert        = false;  // si los colores salen "negativos", cambia a true
+      cfg.invert        = true;   // este panel IPS necesita inversión (si salen negativos, cambia a false)
       cfg.rgb_order     = false;  // si rojo y azul están intercambiados, cambia a true
       cfg.bus_shared    = true;   // el bus SPI puede compartirse con la SD
       _panel.config(cfg);
@@ -113,7 +122,7 @@ LGFX_Sprite canvas(&tft);
 
 // ======================= COLORES =======================
 uint16_t C_BG, C_FUR, C_FUR_DARK, C_CREAM, C_PINK, C_BLUSH, C_EYE, C_PUPIL,
-         C_WHITE, C_LINE, C_CUSHION, C_SHADOW;
+         C_WHITE, C_LINE, C_CUSHION, C_SHADOW, C_CLOCK;
 
 // ======================= ESTRELLAS Y CORAZONES =======================
 struct Star  { int16_t x, y; float phase; };
@@ -126,6 +135,14 @@ Heart hearts[NUM_HEARTS];
 
 uint32_t happyUntil = 0;
 bool wasTouched = false;
+
+// Estados: dormir y ronronear
+uint32_t lastInteraction = 0;
+uint32_t touchStart = 0;
+bool sleeping = false;
+volatile bool purring = false;
+const uint32_t SLEEP_MS     = 30000;   // inactividad para dormirse
+const uint32_t PURR_HOLD_MS = 700;     // tiempo sostenido para ronronear
 
 // HSV -> RGB565 (tono pastel) para el arcoíris del nombre
 uint16_t pastelHue(float h) {
@@ -177,6 +194,7 @@ void updateLed(uint32_t now) {
   uint8_t level = 0;
   uint32_t el = now - ledStart;
   if (ledStart && el < LED_MS) level = 255 - (el * 255 / LED_MS);
+  if (purring) level = (uint8_t)(140.0f + 100.0f * sinf(now / 1000.0f * 2 * PI / 1.8f));  // respira
   if (level == lastLed) return;
   lastLed = level;
   setLed(level * 64 / 255, level * 8 / 255, level * 32 / 255);  // ~25% brillo máx
@@ -226,40 +244,77 @@ bool es8311Init() {
   return true;
 }
 
-// Tarea en el core 0: sintetiza el "miau" sin congelar la animación
-void audioTaskFn(void*) {
-  const int CHUNK = 256;
-  static int16_t buf[CHUNK * 2];   // estéreo
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   // espera un toque
+const int CHUNK = 256;
+static int16_t abuf[CHUNK * 2];   // búfer estéreo compartido
+volatile bool meowPending = false;
 
-    const int total = SAMPLE_RATE * 0.65f;     // 650 ms
-    float phase = 0;
-    for (int n = 0; n < total; ) {
-      int cnt = min(CHUNK, total - n);
-      for (int i = 0; i < cnt; i++, n++) {
-        float p = (float)n / total;   // progreso 0..1
-        // Tono: sube en "mi" y baja en "au"
-        float f0 = (p < 0.3f) ? 550 + (p / 0.3f) * 350
-                              : 900 - ((p - 0.3f) / 0.7f) * 450;
-        f0 *= 1.0f + 0.02f * sinf(2 * PI * 6 * n / SAMPLE_RATE);   // vibrato
-        // "Vocal": más armónicos a la mitad (a), menos al final (u)
-        float open = sinf(PI * p);
-        phase += 2 * PI * f0 / SAMPLE_RATE;
-        if (phase > 2 * PI) phase -= 2 * PI;
-        float s = sinf(phase) + 0.6f * open * sinf(2 * phase)
-                + 0.35f * open * sinf(3 * phase) + 0.15f * open * sinf(4 * phase);
-        // Envolvente: ataque 40 ms + caída suave
-        float env = min(1.0f, n / (0.04f * SAMPLE_RATE)) * powf(1.0f - p, 0.6f);
-        int16_t v = (int16_t)(s * env * 7000);
-        buf[2 * i] = v;
-        buf[2 * i + 1] = v;
-      }
-      i2s.write((uint8_t*)buf, cnt * 4);
+// "Miau": barrido de tono + armónicos (vocal) + vibrato + envolvente
+void playMeow() {
+  const int total = SAMPLE_RATE * 0.65f;     // 650 ms
+  float phase = 0;
+  for (int n = 0; n < total; ) {
+    int cnt = min(CHUNK, total - n);
+    for (int i = 0; i < cnt; i++, n++) {
+      float p = (float)n / total;   // progreso 0..1
+      // Tono: sube en "mi" y baja en "au"
+      float f0 = (p < 0.3f) ? 550 + (p / 0.3f) * 350
+                            : 900 - ((p - 0.3f) / 0.7f) * 450;
+      f0 *= 1.0f + 0.02f * sinf(2 * PI * 6 * n / SAMPLE_RATE);   // vibrato
+      // "Vocal": más armónicos a la mitad (a), menos al final (u)
+      float open = sinf(PI * p);
+      phase += 2 * PI * f0 / SAMPLE_RATE;
+      if (phase > 2 * PI) phase -= 2 * PI;
+      float s = sinf(phase) + 0.6f * open * sinf(2 * phase)
+              + 0.35f * open * sinf(3 * phase) + 0.15f * open * sinf(4 * phase);
+      // Envolvente: ataque 40 ms + caída suave
+      float env = min(1.0f, n / (0.04f * SAMPLE_RATE)) * powf(1.0f - p, 0.6f);
+      int16_t v = (int16_t)(s * env * 7000);
+      abuf[2 * i] = v;
+      abuf[2 * i + 1] = v;
     }
-    // Silencio para vaciar el DMA y evitar zumbido residual
-    memset(buf, 0, sizeof(buf));
-    for (int k = 0; k < 4; k++) i2s.write((uint8_t*)buf, sizeof(buf));
+    i2s.write((uint8_t*)abuf, cnt * 4);
+  }
+}
+
+// Ronroneo: zumbido grave + ruido filtrado, pulsado a ~26 Hz,
+// con un ciclo de "respiración" de 1.8 s. Escribe un bloque de 16 ms.
+void writePurrChunk(float &gain) {
+  static uint32_t pn = 0;
+  static float ph = 0, lp = 0;
+  static uint32_t rng = 12345;
+  for (int i = 0; i < CHUNK; i++, pn++) {
+    float ts = (float)pn / SAMPLE_RATE;
+    float pulse = sinf(PI * 26.0f * ts);
+    pulse *= pulse; pulse *= pulse;                         // pulsos marcados
+    float breath = 0.55f + 0.45f * sinf(2 * PI * ts / 1.8f);
+    ph += 2 * PI * 110.0f / SAMPLE_RATE;
+    if (ph > 2 * PI) ph -= 2 * PI;
+    rng = rng * 1664525u + 1013904223u;                     // ruido rápido (LCG)
+    float noise = (int32_t)rng / 2147483648.0f;             // -1..1
+    lp += 0.08f * (noise - lp);                             // filtro pasa-bajas
+    float s = 0.6f * sinf(ph) + 0.3f * sinf(2 * ph) + 3.0f * lp;
+    if (gain < 1.0f) gain += 1.0f / (0.25f * SAMPLE_RATE);  // entrada suave
+    int16_t v = (int16_t)(s * pulse * breath * gain * 6000);
+    abuf[2 * i] = v;
+    abuf[2 * i + 1] = v;
+  }
+  i2s.write((uint8_t*)abuf, sizeof(abuf));
+}
+
+// Tarea en el core 0: reproduce sin congelar la animación
+void audioTaskFn(void*) {
+  float purrGain = 0;
+  bool dirty = false;   // hubo audio: hay que vaciar el DMA con silencio
+  for (;;) {
+    if (meowPending) { meowPending = false; playMeow(); dirty = true; continue; }
+    if (purring)     { writePurrChunk(purrGain);        dirty = true; continue; }
+    if (dirty) {
+      memset(abuf, 0, sizeof(abuf));
+      for (int k = 0; k < 4; k++) i2s.write((uint8_t*)abuf, sizeof(abuf));
+      dirty = false;
+      purrGain = 0;
+    }
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   // dormir hasta nuevo evento
   }
 }
 
@@ -284,7 +339,13 @@ void audioInit() {
 }
 
 void triggerMeow() {
-  if (audioOk && audioTask) xTaskNotifyGive(audioTask);
+  if (audioOk && audioTask) { meowPending = true; xTaskNotifyGive(audioTask); }
+}
+
+void setPurr(bool on) {
+  if (on == purring) return;
+  purring = on;
+  if (on && audioOk && audioTask) xTaskNotifyGive(audioTask);
 }
 
 // ======================= DIBUJO DEL GATITO =======================
@@ -292,7 +353,8 @@ void drawTail(float t) {
   const float bx = 162, by = 262;
   for (int i = 0; i < 17; i++) {
     float px = bx + i * 3.2f;
-    float py = by - i * 4.5f + sinf(t * 3.0f + i * 0.35f) * (i * 0.9f);
+    float py = by - i * 4.5f + sinf(t * (sleeping ? 0.8f : 3.0f) + i * 0.35f)
+                               * (i * (sleeping ? 0.3f : 0.9f));   // dormido: lenta
     int   r  = 8 - (int)(i * 0.3f);
     canvas.fillCircle(px, py, r, (i > 13) ? C_FUR_DARK : C_FUR);
   }
@@ -307,6 +369,10 @@ void drawBody() {
 }
 
 void drawEye(int ex, int ey, float look, bool blink, bool happy) {
+  if (sleeping) {            // dormido: ojos cerrados ‿
+    canvas.drawArc(ex, ey - 4, 10, 8, 20, 160, C_LINE);
+    return;
+  }
   if (happy) {               // ojos felices ^ ^
     canvas.drawArc(ex, ey + 5, 10, 7, 200, 340, C_LINE);
     return;
@@ -323,8 +389,8 @@ void drawEye(int ex, int ey, float look, bool blink, bool happy) {
 }
 
 void drawHead(float t, uint32_t now) {
-  int cx = 120 + (int)(sinf(t * 1.6f) * 3);
-  int cy = 165 + (int)(sinf(t * 2.0f) * 3);
+  int cx = 120 + (sleeping ? 0 : (int)(sinf(t * 1.6f) * 3));
+  int cy = 165 + (int)(sinf(t * (sleeping ? 1.2f : 2.0f)) * 3);   // dormido: respira lento
 
   // Orejas
   canvas.fillTriangle(cx - 44, cy - 20, cx - 34, cy - 64, cx - 6,  cy - 40, C_FUR);
@@ -368,7 +434,7 @@ void drawHead(float t, uint32_t now) {
 }
 
 void drawName(float t) {
-  int y = 48 + (int)(sinf(t * 3.0f) * 7);
+  int y = 42 + (int)(sinf(t * 3.0f) * 6);   // un poco más arriba para dejar espacio al reloj
   canvas.setFont(&fonts::FreeSansBold24pt7b);
   canvas.setTextSize(1.4f);
   canvas.setTextDatum(middle_center);
@@ -376,6 +442,34 @@ void drawName(float t) {
   canvas.drawString("Sam", 123, y + 3);
   canvas.setTextColor(pastelHue(t * 90.0f));
   canvas.drawString("Sam", 120, y);
+}
+
+// Hora local (HH:MM). No dibuja nada hasta que NTP sincroniza.
+void drawClock() {
+  time_t nowSec = time(nullptr);
+  if (nowSec < 1700000000) return;     // aún sin NTP (getLocalTime haría delay(10))
+  struct tm ti;
+  localtime_r(&nowSec, &ti);
+  char buf[6];
+  strftime(buf, sizeof(buf), "%H:%M", &ti);
+  canvas.setFont(&fonts::FreeSansBold12pt7b);
+  canvas.setTextSize(1.0f);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextColor(C_CLOCK);
+  canvas.drawString(buf, 120, 88);
+}
+
+// Tres "z" que suben desde la cabeza, crecen y se desvanecen
+void drawZzz(float t) {
+  canvas.setFont(&fonts::FreeSansBold12pt7b);
+  canvas.setTextDatum(middle_center);
+  for (int i = 0; i < 3; i++) {
+    float p = fmodf(t * 0.4f + i / 3.0f, 1.0f);   // ciclo 0..1 de cada z
+    float a = sinf(PI * p);                        // aparece y se desvanece
+    canvas.setTextSize(0.6f + p * 0.8f);
+    canvas.setTextColor(canvas.color565(24 + a * 206, 28 + a * 202, 58 + a * 192));
+    canvas.drawString("z", 168 + p * 35 + sinf(t * 2 + i) * 3, 115 - p * 55);
+  }
 }
 
 void drawStars(float t) {
@@ -412,6 +506,12 @@ void setup() {
   setLed(0, 0, 0);
   audioInit();   // después de tft.init(): reutiliza el bus I2C del táctil
 
+  // Wi-Fi + NTP sin bloquear: la hora aparece sola cuando conecta
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Conectando a Wi-Fi: %s\n", WIFI_SSID);
+  configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com");
+
   // Framebuffer completo: 16 bits en PSRAM si hay; si falla, 8 bits
   canvas.setPsram(true);
   canvas.setColorDepth(16);
@@ -434,6 +534,9 @@ void setup() {
   C_LINE     = canvas.color565(90, 50, 30);
   C_CUSHION  = canvas.color565(120, 90, 180);
   C_SHADOW   = canvas.color565(10, 10, 25);
+  C_CLOCK    = canvas.color565(200, 200, 240);
+
+  lastInteraction = millis();
 
   randomSeed(esp_random());
   for (int i = 0; i < NUM_STARS; i++) {
@@ -446,26 +549,49 @@ void loop() {
   uint32_t now = millis();
   float t = now / 1000.0f;
 
-  // Táctil: un toque por pulsación
+  // Diagnóstico: avisar una vez cuando conecta el Wi-Fi
+  static bool wifiReported = false;
+  if (!wifiReported && WiFi.status() == WL_CONNECTED) {
+    wifiReported = true;
+    Serial.printf("Wi-Fi conectado, IP: %s\n", WiFi.localIP().toString().c_str());
+  }
+
+  // Táctil: toque = miau; sostenido = ronroneo
   uint16_t tx, ty;
   if (tft.getTouch(&tx, &ty)) {
-    if (!wasTouched) {
+    if (!wasTouched) {            // inicio del toque
+      touchStart = now;
       happyUntil = now + 1500;
       spawnHearts();
       ledStart = now;   // destello rosa
       triggerMeow();    // ¡miau!
     }
+    if (now - touchStart > PURR_HOLD_MS) {
+      setPurr(true);
+      happyUntil = now + 400;     // ojos felices mientras ronronea
+    }
+    lastInteraction = now;
     wasTouched = true;
   } else {
+    if (wasTouched) setPurr(false);
     wasTouched = false;
+  }
+
+  // Dormir tras inactividad (y atenuar la pantalla)
+  bool shouldSleep = (now - lastInteraction) > SLEEP_MS;
+  if (shouldSleep != sleeping) {
+    sleeping = shouldSleep;
+    tft.setBrightness(sleeping ? 40 : 200);
   }
 
   canvas.fillScreen(C_BG);
   drawStars(t);
   drawName(t);
+  drawClock();
   drawTail(t);
   drawBody();
   drawHead(t, now);
+  if (sleeping) drawZzz(t);
   updateHearts();
   updateLed(now);
 

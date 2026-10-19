@@ -31,6 +31,9 @@ Un gatito que parpadea, mueve la cola y maúlla cuando lo tocas.
 | 👆 **Interacción táctil** | Al tocar: ojos felices `^ ^`, lluvia de corazones 💕 |
 | 💡 **LED RGB** | Destello rosa que se desvanece suavemente |
 | 🔊 **Miau sintetizado** | Generado por código en tiempo real, sin archivos de audio |
+| 😻 **Ronroneo** | Mantén el dedo sobre él: ronronea y el LED "respira" |
+| 😴 **Modo dormido** | Sin toques por 30 s: cierra los ojos, salen "zzz" y la pantalla se atenúa |
+| 🕐 **Reloj Wi-Fi** | Hora sincronizada por NTP debajo del nombre |
 
 Todo el gatito está dibujado con primitivas gráficas (círculos, elipses, triángulos): no usa imágenes ni bitmaps.
 
@@ -96,7 +99,19 @@ En **Tools**:
 
 > ⚠️ **No uses "ESP32 Family Device"** (la opción que aparece al autodetectar). Compila para el chip equivocado y falla.
 
-### 3. Subir
+### 3. Configurar Wi-Fi
+
+Copia `gatito_sam/secrets.example.h` como `gatito_sam/secrets.h` y escribe tu red:
+
+```cpp
+#define WIFI_SSID "TU_RED_WIFI"
+#define WIFI_PASS "TU_CONTRASEÑA"
+```
+
+> 🔒 `secrets.h` está en `.gitignore`, así que tu contraseña nunca se sube al repo.
+> La zona horaria se cambia en `TZ_INFO` (por defecto `CST6`, Ciudad de México).
+
+### 4. Subir
 
 ```bash
 git clone https://github.com/CarlosParraBello/gatito-sam.git
@@ -115,6 +130,9 @@ En el Serial Monitor (115200 baud) deberías ver `Audio OK`.
 | Duración del miau | `audioTaskFn()` → `0.65f` segundos |
 | Colores del gatito | `setup()` → `C_FUR`, `C_EYE`, `C_PINK`… |
 | Color del LED | `updateLed()` → proporciones R/G/B |
+| Tiempo para dormirse | `SLEEP_MS` (ms) |
+| Tiempo para ronronear | `PURR_HOLD_MS` (ms) |
+| Zona horaria | `TZ_INFO` (formato POSIX) |
 
 ## 🩺 Solución de problemas
 
@@ -122,6 +140,18 @@ En el Serial Monitor (115200 baud) deberías ver `Audio OK`.
 <summary><b>Compila con error / "Unable to find executable file .elf"</b></summary>
 
 El `.elf` no se genera porque la compilación falló antes. Revisa que la placa sea **ESP32S3 Dev Module** y busca la primera línea `error:` en la consola.
+</details>
+
+<details>
+<summary><b>"secrets.h: No such file or directory"</b></summary>
+
+Falta crear `secrets.h`: copia `secrets.example.h` con ese nombre (ver Instalación, paso 3).
+</details>
+
+<details>
+<summary><b>No aparece la hora</b></summary>
+
+La hora solo se dibuja cuando el ESP32 se conecta y sincroniza por NTP. Revisa SSID y contraseña, y que la red sea de **2.4 GHz** (el ESP32 no ve redes de 5 GHz).
 </details>
 
 <details>
@@ -146,13 +176,15 @@ Tu revisión de la placa puede no tener el codec o usar otros pines. Revisa el e
 
 - **Render:** todo se dibuja en un `LGFX_Sprite` de 240×320 (16 bits, en PSRAM) y se envía a la pantalla por SPI con DMA en un solo `pushSprite()`.
 - **Audio:** una tarea de FreeRTOS en el *core 0* espera una notificación del toque y sintetiza el miau muestra por muestra: un barrido de tono (sube en "mi", baja en "au"), armónicos que simulan la vocal, vibrato y una envolvente de amplitud. Se envía al ES8311 por I2S a 16 kHz.
+- **Ronroneo:** la misma tarea de audio genera un zumbido grave (110 Hz + ruido filtrado) pulsado a ~26 Hz, como un ronroneo real, con un ciclo de respiración de 1.8 s. Suena en bloques de 16 ms mientras el dedo siga sobre la pantalla.
+- **Reloj:** Wi-Fi y NTP arrancan sin bloquear; `time()` + `localtime_r()` consultan la hora sin esperar, así la animación nunca se congela.
 - **I2C compartido:** el táctil y el codec viven en el mismo bus. El codec se configura con el driver I2C de LovyanGFX para evitar conflictos con `Wire`.
 
 ## 🗺️ Roadmap
 
-- [ ] Modo dormido (ojos cerrados y "zzz") tras inactividad
-- [ ] Reloj por Wi-Fi (NTP)
-- [ ] Ronroneo al mantener presionado
+- [x] Modo dormido (ojos cerrados y "zzz") tras inactividad
+- [x] Reloj por Wi-Fi (NTP)
+- [x] Ronroneo al mantener presionado
 - [ ] Migración a LVGL
 
 ## 🙏 Créditos

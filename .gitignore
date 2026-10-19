@@ -1,3 +1,6 @@
+# Credenciales (nunca subir)
+secrets.h
+
 # Arduino / PlatformIO
 build/
 .pio/
